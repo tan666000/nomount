@@ -1,6 +1,10 @@
 #ifndef _LINUX_NOMOUNT_H
 #define _LINUX_NOMOUNT_H
 
+#ifndef CONFIG_DYNAMIC_FTRACE
+#error "This LKM only works with Ftrace, please enable CONFIG_FUNCTION_TRACE and CONFIG_DYNAMIC_FTRACE in your kernel"
+#endif
+
 #include <linux/types.h>
 #include <linux/list.h>
 #include <linux/hashtable.h>
@@ -29,6 +33,12 @@ static DEFINE_HASHTABLE(nomount_uid_ht,            NOMOUNT_UID_HASH_BITS);
 static LIST_HEAD(nomount_rules_list);
 static LIST_HEAD(nomount_private_dirs_list);
 static DEFINE_MUTEX(nomount_write_mutex);
+
+/* logs */
+#define nm_debug(fmt, ...) printk(KERN_DEBUG "NoMount: [DEBUG] " fmt, ##__VA_ARGS__)
+#define nm_info(fmt, ...) printk(KERN_INFO "NoMount: " fmt, ##__VA_ARGS__)
+#define nm_warn(fmt, ...) printk(KERN_WARNING "NoMount: [WARN] " fmt, ##__VA_ARGS__)
+#define nm_err(fmt, ...)  printk(KERN_ERR "NoMount: [ERROR] " fmt, ##__VA_ARGS__)
 
 struct nomount_rule {
     struct list_head list;
@@ -84,15 +94,6 @@ struct nomount_uid_node {
     uid_t uid;
 };
 
-/* VFS Hook Prototypes */
-char *nomount_handle_dpath(const struct path *path, char *buf, int buflen);
-int nomount_handle_permission(struct inode *inode, int mask);
-struct filename *nomount_handle_getname(struct filename *name);
-int nomount_handle_iterate_dir(struct file *file, struct dir_context *ctx);
-int nomount_handle_getattr(int ret, const struct path *path, struct kstat *stat);
-void nomount_spoof_statfs(const struct path *path, struct kstatfs *buf);
-bool nomount_spoof_mmap_metadata(struct inode *inode, dev_t *dev, unsigned long *ino);
-
 /* ========================================================================= */
 /* NETLINK GENERIC PROTOCOL DEFINITIONS */
 /* ========================================================================= */
@@ -141,5 +142,109 @@ enum {
 
 /* Application UID start */
 #define AID_APP_START 10000
+
+/* ================================ */
+/* Ftrace definitions and helpers   */
+/* ================================ */
+
+// LKM-specific includes
+#include <linux/ftrace.h>
+#include <linux/kprobes.h>
+#include <linux/kallsyms.h>
+#include <linux/module.h>
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,7,0)
+typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
+static kallsyms_lookup_name_t nm_kallsyms;
+
+static int nm_resolve_kallsyms(void) {
+    struct kprobe kp = { .symbol_name = "kallsyms_lookup_name" };
+    int ret = register_kprobe(&kp);
+    if (ret < 0) return ret;
+    nm_kallsyms = (kallsyms_lookup_name_t)kp.addr;
+    unregister_kprobe(&kp);
+    return 0;
+}
+#else
+#define nm_kallsyms(name) kallsyms_lookup_name(name)
+#endif
+
+struct ftrace_ops;
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,11,0)
+#define FTRACE_OPS_FL_RECURSION FTRACE_OPS_FL_RECURSION_SAFE
+#define ftrace_regs pt_regs
+
+static __always_inline struct pt_regs *ftrace_get_regs(struct ftrace_regs *fregs)
+{
+	return fregs;
+}
+#endif
+
+#ifdef __x86_64__
+    #define PT_REGS_IP(regs) ((regs)->ip)
+#else
+    #define PT_REGS_IP(regs) ((regs)->pc)
+#endif
+
+struct nm_hook {
+    const char *name;
+    void *hook_fn;
+    void *orig_fn;
+    unsigned long address;
+    struct ftrace_ops ops;
+};
+
+static int nm_resolve_hook_address(struct nm_hook *hook)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,7,0)
+    if (!nm_kallsyms) {
+        if (nm_resolve_kallsyms()) return -ENOENT;
+    }
+#endif
+
+    hook->address = nm_kallsyms(hook->name);
+    if (!hook->address) {
+        nm_debug("Unresolved symbol: %s\n", hook->name);
+        return -ENOENT;
+    }
+
+    *((unsigned long*) hook->orig_fn) = hook->address;
+    return 0;
+}
+
+static void notrace nm_ftrace_thunk(unsigned long ip, unsigned long parent_ip,
+                                     struct ftrace_ops *ops, struct ftrace_regs *fregs)
+{
+    struct pt_regs *regs = ftrace_get_regs(fregs);
+    struct nm_hook *hook = container_of(ops, struct nm_hook, ops);
+
+    if (!within_module(parent_ip, THIS_MODULE)) {
+        PT_REGS_IP(regs) = (unsigned long)hook->hook_fn;
+    }
+}
+
+static int nm_install_hook(struct nm_hook *hook) {
+    int ret;
+
+    ret = nm_resolve_hook_address(hook);
+    if (ret) return ret;
+
+    hook->ops.func = nm_ftrace_thunk;
+    hook->ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_RECURSION | FTRACE_OPS_FL_IPMODIFY;
+
+    ret = ftrace_set_filter_ip(&hook->ops, hook->address, 0, 0);
+    if (ret) return ret;
+
+    ret = register_ftrace_function(&hook->ops);
+    if (ret) ftrace_set_filter_ip(&hook->ops, hook->address, 1, 0);
+  
+    return ret;
+}
+
+static void nm_remove_hook(struct nm_hook *hook) {
+    unregister_ftrace_function(&hook->ops);
+    ftrace_set_filter_ip(&hook->ops, hook->address, 1, 0);
+}
 
 #endif /* _LINUX_NOMOUNT_H */
