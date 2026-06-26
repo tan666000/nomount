@@ -264,7 +264,7 @@ int nomount_handle_permission(struct inode *inode, int mask)
         }
         if (unlikely(is_private)) {
             rcu_read_unlock();
-            return -ENOENT;
+            return 0; // standard vfs check permissions
         }
     }
     rcu_read_unlock();
@@ -535,7 +535,7 @@ int nomount_handle_getattr(int ret, const struct path *path, struct kstat *stat)
     }
     if (unlikely(parent_is_private && !child_node)) {
         rcu_read_unlock();
-        return -ENOENT;
+        return ret;
     }
 
     if (child_node) {
