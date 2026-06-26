@@ -499,11 +499,9 @@ do_real_iterate:
  */
 int nomount_handle_getattr(int ret, const struct path *path, struct kstat *stat)
 {
-    struct nm_inode_node *child_node = NULL, *tmp_node;
+    struct nm_inode_node *inode_node;
     struct nomount_rule *rule;
-    struct inode *inode, *parent_inode;
-    struct dentry *parent_dentry;
-    bool parent_is_private = false;
+    struct inode *inode;
 
     if (unlikely(ret != 0 || __nomount_should_skip())) return ret;
     if (unlikely(IS_ERR_OR_NULL(path) || IS_ERR_OR_NULL(stat) || IS_ERR_OR_NULL(path->dentry))) return ret;
@@ -512,45 +510,15 @@ int nomount_handle_getattr(int ret, const struct path *path, struct kstat *stat)
     if (unlikely(IS_ERR_OR_NULL(inode) || IS_ERR_OR_NULL(inode->i_sb))) return ret;
 
     rcu_read_lock();
-    hash_for_each_possible_rcu(nomount_inodes_ht, tmp_node, node, inode->i_ino) {
-        if (tmp_node->ino == inode->i_ino && tmp_node->dev == inode->i_sb->s_dev) {
-            child_node = tmp_node;
+    hash_for_each_possible_rcu(nomount_inodes_ht, inode_node, node, inode->i_ino) {
+        if (inode_node->ino == inode->i_ino && inode_node->dev == inode->i_sb->s_dev) {
+            if (inode_node->type & NM_INO_TYPE_REAL) {
+                rule = container_of(inode_node, struct nomount_rule, real_node);
+                stat->ino = READ_ONCE(rule->virt_node.ino);
+                if (rule->virt_node.dev != 0)
+                    stat->dev = READ_ONCE(rule->virt_node.dev);
+            }
             break;
-        }
-    }
-    parent_dentry = path->dentry->d_parent;
-    if (parent_dentry && current_uid().val >= AID_APP_START) {
-        parent_inode = d_backing_inode(parent_dentry);
-        if (parent_inode) {
-            hash_for_each_possible_rcu(nomount_inodes_ht, tmp_node, node, parent_inode->i_ino) {
-                if (tmp_node->ino == parent_inode->i_ino && tmp_node->dev == parent_inode->i_sb->s_dev) {
-                    if (tmp_node->type & NM_INO_TYPE_DIR) {
-                        struct nomount_dir_node *p_dir = container_of(tmp_node, struct nomount_dir_node, dir);
-                        if (p_dir->is_private) parent_is_private = true;
-                    }
-                    break;
-                }
-            }
-        }
-    }
-    if (unlikely(parent_is_private && !child_node)) {
-        rcu_read_unlock();
-        return ret;
-    }
-
-    if (child_node) {
-        if (child_node->type & NM_INO_TYPE_VIRTUAL) {
-            rule = container_of(child_node, struct nomount_rule, virt_node);
-            if (rule->flags & NM_FLAG_WHITEOUT) {
-                rcu_read_unlock();
-                return -ENOENT; 
-            }
-        }
-        if (child_node->type & NM_INO_TYPE_REAL) {
-            rule = container_of(child_node, struct nomount_rule, real_node);
-            stat->ino = READ_ONCE(rule->virt_node.ino);
-            if (rule->virt_node.dev != 0)
-                stat->dev = READ_ONCE(rule->virt_node.dev);
         }
     }
     rcu_read_unlock();
